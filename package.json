@@ -1,0 +1,12 @@
+{
+  "name": "jiva-florist-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend Node.js tanpa dependensi eksternal untuk sistem JIVA FLORIST",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
