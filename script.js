@@ -99,12 +99,19 @@ function showLogin(message = "") {
   document.getElementById("login-username").focus();
 }
 
-function showPasswordReset(message = "") {
+function showPasswordReset(flowType, message = "") {
   document.querySelector(".app-shell").hidden = true;
   document.getElementById("login-screen").hidden = false;
   document.getElementById("login-form").hidden = true;
   const form = document.getElementById("password-reset-form");
   form.hidden = false;
+  const isInvitation = flowType === "invite" || flowType === "signup";
+  document.getElementById("password-reset-title").textContent = isInvitation
+    ? "Buat kata sandi akun"
+    : "Buat kata sandi baru";
+  document.getElementById("password-reset-description").textContent = isInvitation
+    ? "Tentukan kata sandi untuk menyelesaikan undangan JIVA FLORIST."
+    : "Atur kata sandi baru untuk akun JIVA FLORIST kamu.";
   const error = document.getElementById("password-reset-error");
   error.textContent = message;
   error.hidden = !message;
@@ -1237,15 +1244,15 @@ document.addEventListener("DOMContentLoaded", () => {
         document.getElementById("connection-dot").classList.add("connection-error");
         return;
       }
-      const recoveryLink = cloudMode && new URLSearchParams(location.hash.slice(1)).get("type") === "recovery";
-      if (recoveryLink) {
+      const authFlowType = cloudMode ? new URLSearchParams(location.hash.slice(1)).get("type") : null;
+      if (authFlowType === "recovery" || authFlowType === "invite" || authFlowType === "signup") {
         const { data, error } = await getCloudClient().auth.getSession();
         if (error) throw new Error(error.message);
         if (!data.session) {
-          showLogin("Tautan reset tidak valid atau sudah kedaluwarsa. Minta tautan baru dengan tombol Lupa kata sandi.");
+          showLogin("Tautan undangan/reset tidak valid atau sudah kedaluwarsa. Minta pemilik mengirim tautan baru.");
           return;
         }
-        showPasswordReset();
+        showPasswordReset(authFlowType);
         return;
       }
       if (location.protocol === "file:") await discoverLocalApi();
