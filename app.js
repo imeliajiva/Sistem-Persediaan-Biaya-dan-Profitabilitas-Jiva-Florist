@@ -1,15 +1,35 @@
 "use strict";
 
 const http = require("node:http");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { URL } = require("node:url");
 const supabase = require("./supabase");
 
-const root = path.resolve(__dirname, "..");
-const frontendRoot = path.join(root, "frontend");
-const host = process.env.HOST || "127.0.0.1";
+const projectRoot = path.resolve(__dirname, "..");
+const nestedFrontendRoot = path.join(projectRoot, "frontend");
+const hasNestedFrontend = fs.existsSync(path.join(nestedFrontendRoot, "index.html"));
+const root = hasNestedFrontend ? projectRoot : __dirname;
+const frontendRoot = hasNestedFrontend ? nestedFrontendRoot : __dirname;
+const production = process.env.NODE_ENV === "production";
+const authRequired = production;
+const sessionCookieName = "jiva_session";
+const sessionDurationSeconds = 60 * 60 * 12;
+const loginAttempts = new Map();
+const host = process.env.HOST || (production ? "0.0.0.0" : "127.0.0.1");
 const port = Number(process.env.PORT || 3000);
+const authConfig = production ? {
+  username: process.env.APP_USERNAME,
+  password: process.env.APP_PASSWORD,
+  secret: process.env.SESSION_SECRET
+} : null;
+
+if (production && (!authConfig.username || !authConfig.password || Buffer.byteLength(authConfig.password) < 12
+  || !authConfig.secret || Buffer.byteLength(authConfig.secret) < 32)) {
+  throw new Error("Atur APP_USERNAME, APP_PASSWORD (minimal 12 karakter), dan SESSION_SECRET (minimal 32 karakter) pada environment hosting.");
+}
+
 const publicFiles = new Set([
   path.join(frontendRoot, "index.html"),
   path.join(frontendRoot, "style.css"),
@@ -41,6 +61,93 @@ function allowLocalFileOrigin(request, response) {
     response.setHeader("Access-Control-Allow-Origin", "null");
     response.setHeader("Vary", "Origin");
   }
+}
+
+function sessionSignature(payload) {
+  return crypto.createHmac("sha256", authConfig.secret).update(payload).digest("base64url");
+}
+
+function parseCookies(header = "") {
+  return Object.fromEntries(header.split(";").map((part) => {
+    const separator = part.indexOf("=");
+    return separator < 0 ? ["", ""] : [part.slice(0, separator).trim(), part.slice(separator + 1).trim()];
+  }).filter(([name]) => name));
+}
+
+function isAuthenticated(request) {
+  if (!authRequired) return true;
+  const token = parseCookies(request.headers.cookie)[sessionCookieName];
+  if (!token) return false;
+  const [payload, suppliedSignature, extra] = token.split(".");
+  if (!payload || !suppliedSignature || extra) return false;
+  const expectedSignature = sessionSignature(payload);
+  const supplied = Buffer.from(suppliedSignature);
+  const expected = Buffer.from(expectedSignature);
+  if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) return false;
+  try {
+    const session = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    return session.username === authConfig.username
+      && Number.isInteger(session.expires)
+      && session.expires > Math.floor(Date.now() / 1000);
+  } catch {
+    return false;
+  }
+}
+
+function createSession(username) {
+  const payload = Buffer.from(JSON.stringify({
+    username,
+    expires: Math.floor(Date.now() / 1000) + sessionDurationSeconds
+  })).toString("base64url");
+  return `${payload}.${sessionSignature(payload)}`;
+}
+
+function setSessionCookie(response, token) {
+  const secure = production ? "; Secure" : "";
+  response.setHeader("Set-Cookie", `${sessionCookieName}=${token}; Path=/; HttpOnly; SameSite=Lax${secure}; Max-Age=${sessionDurationSeconds}`);
+}
+
+function clearSessionCookie(response) {
+  const secure = production ? "; Secure" : "";
+  response.setHeader("Set-Cookie", `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax${secure}; Max-Age=0`);
+}
+
+function isSameOrigin(request) {
+  const origin = request.headers.origin;
+  if (!production) return true;
+  if (!origin) return false;
+  try {
+    const parsed = new URL(origin);
+    const forwardedProtocol = String(request.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+    return parsed.protocol === "https:" && parsed.host === request.headers.host && forwardedProtocol === "https";
+  } catch {
+    return false;
+  }
+}
+
+function allowLoginAttempt(request) {
+  const forwardedAddress = String(request.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  const key = forwardedAddress || request.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  if (loginAttempts.size > 1000) {
+    for (const [address, attempt] of loginAttempts) {
+      if (attempt.resetAt <= now) loginAttempts.delete(address);
+    }
+  }
+  const record = loginAttempts.get(key);
+  if (!record || record.resetAt <= now) {
+    loginAttempts.set(key, { count: 1, resetAt: now + 15 * 60 * 1000 });
+    return true;
+  }
+  if (record.count >= 5) return false;
+  record.count += 1;
+  return true;
+}
+
+function verifyCredentials(username, password) {
+  const submitted = crypto.createHash("sha256").update(`${username}\0${password}`).digest();
+  const expected = crypto.createHash("sha256").update(`${authConfig.username}\0${authConfig.password}`).digest();
+  return crypto.timingSafeEqual(submitted, expected);
 }
 
 function sendCsv(response, filename, rows) {
@@ -194,11 +301,37 @@ function normalizeNewProduct(value) {
 }
 
 async function handleApi(request, response, url) {
+  if (request.method === "GET" && url.pathname === "/api/auth/session") {
+    return sendJson(response, 200, { authenticated: isAuthenticated(request), required: authRequired });
+  }
+  if (request.method === "POST" && url.pathname === "/api/auth/login") {
+    if (!authRequired) return sendJson(response, 200, { authenticated: true });
+    if (!allowLoginAttempt(request)) {
+      return sendJson(response, 429, { error: "Terlalu banyak percobaan masuk. Coba lagi dalam 15 menit." });
+    }
+    const body = await readJson(request);
+    if (typeof body.username !== "string" || typeof body.password !== "string"
+      || !verifyCredentials(body.username, body.password)) {
+      return sendJson(response, 401, { error: "Nama pengguna atau kata sandi tidak sesuai." });
+    }
+    const key = String(request.headers["x-forwarded-for"] || "").split(",")[0].trim() || request.socket.remoteAddress || "unknown";
+    loginAttempts.delete(key);
+    setSessionCookie(response, createSession(body.username));
+    return sendJson(response, 200, { authenticated: true });
+  }
+  if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+    clearSessionCookie(response);
+    return sendJson(response, 200, { authenticated: false });
+  }
   if (request.method === "GET" && url.pathname === "/api/health") {
     try {
       await supabase.getDashboard(1);
       return sendJson(response, 200, { status: "ok", database: "connected", features: ["supplier-invoices"] });
     } catch (error) {
+      if (production) {
+        console.error(`[health] ${error.message}`);
+        return sendJson(response, 503, { status: "error", database: "unavailable" });
+      }
       return sendJson(response, 503, { error: error.message });
     }
   }
@@ -440,6 +573,12 @@ async function serve(request, response) {
   const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
   if (url.pathname.startsWith("/api/")) {
     allowLocalFileOrigin(request, response);
+    const isLoginRequest = request.method === "POST" && url.pathname === "/api/auth/login";
+    if (production && (request.headers.origin
+      ? !isSameOrigin(request)
+      : request.method !== "GET" && request.method !== "HEAD")) {
+      return sendJson(response, 403, { error: "Permintaan harus berasal dari situs JIVA FLORIST yang sama." });
+    }
     if (request.method === "OPTIONS") {
       if (request.headers.origin !== "null") {
         return sendJson(response, 403, { error: "Permintaan lintas origin tidak diizinkan." });
@@ -452,6 +591,15 @@ async function serve(request, response) {
       });
       response.end();
       return;
+    }
+    const publicRoute = request.method === "GET" && url.pathname === "/api/auth/session"
+      || request.method === "POST" && (url.pathname === "/api/auth/login" || url.pathname === "/api/auth/logout")
+      || request.method === "GET" && url.pathname === "/api/health";
+    if (!publicRoute && !isAuthenticated(request)) {
+      return sendJson(response, 401, { error: "Sesi masuk berakhir. Silakan masuk kembali." });
+    }
+    if (isLoginRequest && !isSameOrigin(request)) {
+      return sendJson(response, 403, { error: "Permintaan masuk harus berasal dari situs JIVA FLORIST." });
     }
     try {
       await handleApi(request, response, url);
