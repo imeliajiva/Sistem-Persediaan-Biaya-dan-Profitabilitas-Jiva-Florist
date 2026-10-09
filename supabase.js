@@ -71,7 +71,7 @@ async function getDashboard(days) {
 
 async function getTransactions(limit) {
   const params = new URLSearchParams({
-    select: "id,group_id,product_id,type,description,quantity,unit_price,subtotal,cogs,gross_profit,vat_rate,vat_amount,occurred_at,supplier_invoice_path,supplier_invoice_filename,products(name,unit),inventory_batches(supplier,quantity_remaining,quantity_in)",
+    select: "id,group_id,product_id,type,description,quantity,unit_price,subtotal,cogs,gross_profit,vat_rate,vat_amount,occurred_at,supplier_invoice_path,supplier_invoice_filename,products(name,unit),inventory_batches(supplier,supplier_id,quantity_remaining,quantity_in,suppliers(name))",
     order: "occurred_at.desc",
     limit: String(limit)
   });
@@ -80,7 +80,7 @@ async function getTransactions(limit) {
     ...transaction,
     product_name: transaction.products?.name || null,
     unit: transaction.products?.unit || "",
-    batch_supplier: transaction.inventory_batches?.[0]?.supplier || "",
+    batch_supplier: transaction.inventory_batches?.[0]?.suppliers?.name || transaction.inventory_batches?.[0]?.supplier || "",
     batch_remaining: transaction.inventory_batches?.[0]?.quantity_remaining ?? null,
     batch_quantity: transaction.inventory_batches?.[0]?.quantity_in ?? null,
     has_supplier_invoice: Boolean(transaction.supplier_invoice_path),

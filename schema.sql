@@ -1,4 +1,4 @@
--- JIVA FLORIST — skema inti tiga entitas untuk PostgreSQL / Supabase.
+-- JIVA FLORIST — skema inti empat entitas untuk PostgreSQL / Supabase.
 -- Nilai moneter disimpan dalam rupiah; biaya pembelian langsung per unit
 -- mencakup harga beli dan ongkos langsung yang dialokasikan ke produk.
 
@@ -20,9 +20,19 @@ alter table public.products
   add column if not exists selling_price_override numeric(16, 2)
   check (selling_price_override is null or selling_price_override > 0);
 
+create table if not exists public.suppliers (
+  id uuid primary key default gen_random_uuid(),
+  name text not null check (length(trim(name)) between 1 and 120),
+  created_at timestamptz not null default now()
+);
+
+create unique index if not exists suppliers_name_normalized_idx
+  on public.suppliers (lower(trim(name)));
+
 create table if not exists public.inventory_batches (
   id uuid primary key default gen_random_uuid(),
   product_id uuid not null references public.products(id),
+  supplier_id uuid references public.suppliers(id),
   purchase_date date not null default (timezone('Asia/Jakarta', now())::date),
   quantity_in numeric(14, 3) not null check (quantity_in > 0),
   quantity_remaining numeric(14, 3) not null check (quantity_remaining >= 0 and quantity_remaining <= quantity_in),
@@ -84,6 +94,7 @@ $$;
 
 alter table public.inventory_batches
   add column if not exists purchase_date date not null default (timezone('Asia/Jakarta', now())::date),
+  add column if not exists supplier_id uuid references public.suppliers(id),
   add column if not exists quantity_in numeric(14, 3),
   add column if not exists quantity_remaining numeric(14, 3),
   add column if not exists carrying_unit_cost numeric(16, 2),
@@ -173,6 +184,20 @@ begin
 end;
 $$;
 
+insert into public.suppliers (name)
+select min(trim(supplier))
+from public.inventory_batches
+where nullif(trim(supplier), '') is not null
+group by lower(trim(supplier))
+on conflict do nothing;
+
+update public.inventory_batches b
+set supplier_id = s.id
+from public.suppliers s
+where b.supplier_id is null
+  and nullif(trim(b.supplier), '') is not null
+  and lower(trim(b.supplier)) = lower(trim(s.name));
+
 alter table public.inventory_batches
   alter column quantity_in set not null,
   alter column quantity_remaining set not null,
@@ -224,6 +249,37 @@ set public = false,
 create index if not exists transactions_occurred_at_idx on public.transactions (occurred_at desc);
 create index if not exists transactions_product_occurred_idx on public.transactions (product_id, occurred_at desc);
 
+-- Private access allowlist; this is not a business/ERD entity.
+create schema if not exists private;
+
+create table if not exists private.jiva_allowed_users (
+  email text primary key check (
+    email = lower(trim(email))
+    and email ~ '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
+  ),
+  created_at timestamptz not null default now()
+);
+
+alter table private.jiva_allowed_users enable row level security;
+revoke all on private.jiva_allowed_users from public, anon, authenticated, service_role;
+
+create or replace function public.is_jiva_user()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select coalesce(auth.role(), '') = 'authenticated'
+    and exists (
+      select 1 from private.jiva_allowed_users
+      where email = lower(coalesce(auth.jwt()->>'email', ''))
+    );
+$$;
+
+revoke all on function public.is_jiva_user() from public, anon, authenticated;
+grant execute on function public.is_jiva_user() to authenticated;
+
 alter table public.inventory_batches
   add column if not exists source_transaction_id uuid;
 
@@ -267,11 +323,132 @@ where b.id = c.batch_id
   and c.transaction_matches = 1;
 
 alter table public.products enable row level security;
+alter table public.suppliers enable row level security;
 alter table public.inventory_batches enable row level security;
 alter table public.transactions enable row level security;
 
-revoke all on public.products, public.inventory_batches, public.transactions from anon, authenticated;
-grant all on public.products, public.inventory_batches, public.transactions to service_role;
+revoke all on public.products, public.suppliers, public.inventory_batches, public.transactions from anon, authenticated;
+grant usage on schema public to authenticated;
+grant all on public.products, public.suppliers, public.inventory_batches, public.transactions to service_role;
+grant select on public.products, public.suppliers, public.inventory_batches, public.transactions to authenticated;
+
+drop policy if exists "JIVA invited users read products" on public.products;
+create policy "JIVA invited users read products"
+  on public.products for select to authenticated
+  using ((select public.is_jiva_user()));
+
+drop policy if exists "JIVA invited users read inventory batches" on public.inventory_batches;
+create policy "JIVA invited users read inventory batches"
+  on public.inventory_batches for select to authenticated
+  using ((select public.is_jiva_user()));
+
+drop policy if exists "JIVA invited users read suppliers" on public.suppliers;
+create policy "JIVA invited users read suppliers"
+  on public.suppliers for select to authenticated
+  using ((select public.is_jiva_user()));
+
+drop policy if exists "JIVA invited users read transactions" on public.transactions;
+create policy "JIVA invited users read transactions"
+  on public.transactions for select to authenticated
+  using ((select public.is_jiva_user()));
+
+drop policy if exists "JIVA data requires invited account" on public.products;
+create policy "JIVA data requires invited account"
+  on public.products as restrictive for all to public
+  using ((select public.is_jiva_user()))
+  with check ((select public.is_jiva_user()));
+
+drop policy if exists "JIVA batches require invited account" on public.inventory_batches;
+create policy "JIVA batches require invited account"
+  on public.inventory_batches as restrictive for all to public
+  using ((select public.is_jiva_user()))
+  with check ((select public.is_jiva_user()));
+
+drop policy if exists "JIVA suppliers require invited account" on public.suppliers;
+create policy "JIVA suppliers require invited account"
+  on public.suppliers as restrictive for all to public
+  using ((select public.is_jiva_user()))
+  with check ((select public.is_jiva_user()));
+
+drop policy if exists "JIVA transactions require invited account" on public.transactions;
+create policy "JIVA transactions require invited account"
+  on public.transactions as restrictive for all to public
+  using ((select public.is_jiva_user()))
+  with check ((select public.is_jiva_user()));
+
+drop policy if exists "JIVA invited users read supplier invoices" on storage.objects;
+create policy "JIVA invited users read supplier invoices"
+  on storage.objects for select to authenticated
+  using (
+    bucket_id = 'supplier-invoices'
+    and (select public.is_jiva_user())
+    and exists (
+      select 1 from public.transactions t
+      where t.type = 'purchase'
+        and t.group_id::text = split_part(name, '/', 1)
+    )
+  );
+
+drop policy if exists "JIVA invited users upload supplier invoices" on storage.objects;
+create policy "JIVA invited users upload supplier invoices"
+  on storage.objects for insert to authenticated
+  with check (
+    bucket_id = 'supplier-invoices'
+    and (select public.is_jiva_user())
+    and exists (
+      select 1 from public.transactions t
+      where t.type = 'purchase'
+        and t.group_id::text = split_part(name, '/', 1)
+    )
+  );
+
+drop policy if exists "JIVA invited users replace supplier invoices" on storage.objects;
+create policy "JIVA invited users replace supplier invoices"
+  on storage.objects for update to authenticated
+  using (
+    bucket_id = 'supplier-invoices'
+    and (select public.is_jiva_user())
+    and exists (
+      select 1 from public.transactions t
+      where t.type = 'purchase'
+        and t.group_id::text = split_part(name, '/', 1)
+    )
+  )
+  with check (
+    bucket_id = 'supplier-invoices'
+    and (select public.is_jiva_user())
+    and exists (
+      select 1 from public.transactions t
+      where t.type = 'purchase'
+        and t.group_id::text = split_part(name, '/', 1)
+    )
+  );
+
+drop policy if exists "JIVA invoices require invited account" on storage.objects;
+create policy "JIVA invoices require invited account"
+  on storage.objects as restrictive for all to public
+  using (
+    bucket_id <> 'supplier-invoices'
+    or (
+      (select public.is_jiva_user())
+      and exists (
+        select 1 from public.transactions t
+        where t.type = 'purchase'
+          and t.group_id::text = split_part(name, '/', 1)
+      )
+    )
+  )
+  with check (
+    bucket_id <> 'supplier-invoices'
+    or (
+      (select public.is_jiva_user())
+      and exists (
+        select 1 from public.transactions t
+        where t.type = 'purchase'
+          and t.group_id::text = split_part(name, '/', 1)
+      )
+    )
+  );
 
 create or replace function public.register_purchase(
   p_product_id uuid,
@@ -282,7 +459,7 @@ create or replace function public.register_purchase(
 )
 returns jsonb
 language plpgsql
-security invoker
+security definer
 set search_path = public, pg_temp
 as $$
 declare
@@ -290,12 +467,20 @@ declare
   v_batch_id uuid;
   v_transaction_id uuid;
   v_product_id uuid := p_product_id;
+  v_supplier_name text := nullif(trim(p_supplier), '');
+  v_supplier_id uuid;
 begin
+  if coalesce(auth.role(), '') <> 'service_role' and not public.is_jiva_user() then
+    raise exception 'Silakan masuk untuk mengubah data JIVA FLORIST.' using errcode = '42501';
+  end if;
   if p_quantity is null or p_quantity <= 0 or p_quantity > 1000000 then
     raise exception 'Jumlah pembelian harus lebih dari 0 dan tidak melebihi 1.000.000.' using errcode = '22023';
   end if;
   if p_unit_cost is null or p_unit_cost <= 0 or p_unit_cost > 1000000000000 then
     raise exception 'Biaya per unit harus lebih dari 0.' using errcode = '22023';
+  end if;
+  if v_supplier_name is not null and length(v_supplier_name) > 120 then
+    raise exception 'Nama pemasok maksimal 120 karakter.' using errcode = '22023';
   end if;
 
   if v_product_id is null then
@@ -322,10 +507,24 @@ begin
     end if;
   end if;
 
+  if v_supplier_name is not null then
+    select id into v_supplier_id
+    from public.suppliers
+    where lower(trim(name)) = lower(v_supplier_name);
+    if not found then
+      insert into public.suppliers (name)
+      values (v_supplier_name)
+      on conflict do nothing;
+      select id into v_supplier_id
+      from public.suppliers
+      where lower(trim(name)) = lower(v_supplier_name);
+    end if;
+  end if;
+
   insert into public.inventory_batches (
-    product_id, quantity_in, quantity_remaining, unit_cost, carrying_unit_cost, supplier
+    product_id, supplier_id, quantity_in, quantity_remaining, unit_cost, carrying_unit_cost, supplier
   )
-  values (v_product_id, p_quantity, p_quantity, round(p_unit_cost, 2), round(p_unit_cost, 2), nullif(trim(p_supplier), ''))
+  values (v_product_id, v_supplier_id, p_quantity, p_quantity, round(p_unit_cost, 2), round(p_unit_cost, 2), v_supplier_name)
   returning id into v_batch_id;
 
   insert into public.transactions (
@@ -334,7 +533,7 @@ begin
   values (
     v_product_id,
     'purchase',
-    'Pembelian ' || v_product.name || case when nullif(trim(p_supplier), '') is null then '' else ' · ' || trim(p_supplier) end,
+    'Pembelian ' || v_product.name || case when v_supplier_name is null then '' else ' · ' || v_supplier_name end,
     p_quantity,
     round(p_unit_cost, 2),
     round(p_quantity * p_unit_cost, 2)
@@ -363,7 +562,7 @@ create or replace function public.register_purchase_batch(
 )
 returns jsonb
 language plpgsql
-security invoker
+security definer
 set search_path = public, pg_temp
 as $$
 declare
@@ -373,6 +572,9 @@ declare
   v_group_id uuid := gen_random_uuid();
   v_count integer := 0;
 begin
+  if coalesce(auth.role(), '') <> 'service_role' and not public.is_jiva_user() then
+    raise exception 'Silakan masuk untuk mengubah data JIVA FLORIST.' using errcode = '42501';
+  end if;
   if p_items is null or jsonb_typeof(p_items) <> 'array' then
     raise exception 'Daftar pembelian harus berupa array.' using errcode = '22023';
   end if;
@@ -419,7 +621,7 @@ create or replace function public.register_sale(
 )
 returns jsonb
 language plpgsql
-security invoker
+security definer
 set search_path = public, pg_temp
 as $$
 declare
@@ -435,6 +637,9 @@ declare
   v_transaction_id uuid;
   v_allocations jsonb := '[]'::jsonb;
 begin
+  if coalesce(auth.role(), '') <> 'service_role' and not public.is_jiva_user() then
+    raise exception 'Silakan masuk untuk mengubah data JIVA FLORIST.' using errcode = '42501';
+  end if;
   if p_quantity is null or p_quantity <= 0 or p_quantity > 1000000 then
     raise exception 'Jumlah penjualan harus lebih dari 0 dan tidak melebihi 1.000.000.' using errcode = '22023';
   end if;
@@ -536,7 +741,7 @@ create or replace function public.register_sale_batch(
 )
 returns jsonb
 language plpgsql
-security invoker
+security definer
 set search_path = public, pg_temp
 as $$
 declare
@@ -551,6 +756,9 @@ declare
   v_vat numeric(16, 2) := 0;
   v_cogs numeric(16, 2) := 0;
 begin
+  if coalesce(auth.role(), '') <> 'service_role' and not public.is_jiva_user() then
+    raise exception 'Silakan masuk untuk mengubah data JIVA FLORIST.' using errcode = '42501';
+  end if;
   if p_items is null or jsonb_typeof(p_items) <> 'array' then
     raise exception 'Daftar penjualan harus berupa array.' using errcode = '22023';
   end if;
@@ -619,13 +827,16 @@ create or replace function public.register_expense(
 )
 returns jsonb
 language plpgsql
-security invoker
+security definer
 set search_path = public, pg_temp
 as $$
 declare
   v_transaction_id uuid;
   v_occurred_at timestamptz := coalesce(p_occurred_at, now());
 begin
+  if coalesce(auth.role(), '') <> 'service_role' and not public.is_jiva_user() then
+    raise exception 'Silakan masuk untuk mengubah data JIVA FLORIST.' using errcode = '42501';
+  end if;
   if p_description is null or length(trim(p_description)) = 0 or length(trim(p_description)) > 240 then
     raise exception 'Deskripsi biaya wajib diisi (maksimal 240 karakter).' using errcode = '22023';
   end if;
@@ -650,7 +861,7 @@ create or replace function public.assess_inventory_nrv(
 )
 returns jsonb
 language plpgsql
-security invoker
+security definer
 set search_path = public, pg_temp
 as $$
 declare
@@ -661,6 +872,9 @@ declare
   v_updated_cost numeric(16, 2);
   v_transaction_id uuid;
 begin
+  if coalesce(auth.role(), '') <> 'service_role' and not public.is_jiva_user() then
+    raise exception 'Silakan masuk untuk mengubah data JIVA FLORIST.' using errcode = '42501';
+  end if;
   if p_nrv_unit is null or p_nrv_unit < 0 or p_nrv_unit > 1000000000000 then
     raise exception 'Nilai realisasi neto per unit harus nol atau lebih.' using errcode = '22023';
   end if;
@@ -861,13 +1075,16 @@ $$;
 create or replace function public.edit_product(p_product_id uuid, p_changes jsonb)
 returns jsonb
 language plpgsql
-security invoker
+security definer
 set search_path = public, pg_temp
 as $$
 declare
   v_product public.products%rowtype;
   v_key text;
 begin
+  if coalesce(auth.role(), '') <> 'service_role' and not public.is_jiva_user() then
+    raise exception 'Silakan masuk untuk mengubah data JIVA FLORIST.' using errcode = '42501';
+  end if;
   if p_changes is null or jsonb_typeof(p_changes) <> 'object' or p_changes = '{}'::jsonb then
     raise exception 'Tidak ada perubahan produk yang dikirim.' using errcode = '22023';
   end if;
@@ -934,7 +1151,7 @@ $$;
 create or replace function public.edit_transaction(p_transaction_id uuid, p_changes jsonb)
 returns jsonb
 language plpgsql
-security invoker
+security definer
 set search_path = public, pg_temp
 as $$
 declare
@@ -947,8 +1164,12 @@ declare
   v_amount numeric;
   v_occurred_at timestamptz;
   v_supplier text;
+  v_supplier_id uuid;
   v_has_batch boolean;
 begin
+  if coalesce(auth.role(), '') <> 'service_role' and not public.is_jiva_user() then
+    raise exception 'Silakan masuk untuk mengubah data JIVA FLORIST.' using errcode = '42501';
+  end if;
   if p_changes is null or jsonb_typeof(p_changes) <> 'object' or p_changes = '{}'::jsonb then
     raise exception 'Tidak ada perubahan transaksi yang dikirim.' using errcode = '22023';
   end if;
@@ -1012,6 +1233,22 @@ begin
     end if;
     if v_has_batch and (p_changes ? 'quantity' or p_changes ? 'unit_cost' or p_changes ? 'supplier' or p_changes ? 'occurred_at') then
       v_supplier := case when p_changes ? 'supplier' then nullif(trim(p_changes->>'supplier'), '') else v_batch.supplier end;
+      if v_supplier is not null and length(v_supplier) > 120 then
+        raise exception 'Nama pemasok maksimal 120 karakter.' using errcode = '22023';
+      end if;
+      if v_supplier is not null then
+        select id into v_supplier_id
+        from public.suppliers
+        where lower(trim(name)) = lower(v_supplier);
+        if not found then
+          insert into public.suppliers (name)
+          values (v_supplier)
+          on conflict do nothing;
+          select id into v_supplier_id
+          from public.suppliers
+          where lower(trim(name)) = lower(v_supplier);
+        end if;
+      end if;
       update public.inventory_batches
       set quantity_in = v_quantity,
           quantity_remaining = v_quantity,
@@ -1020,6 +1257,7 @@ begin
             when carrying_unit_cost = unit_cost then round(v_unit_price, 2)
             else least(carrying_unit_cost, round(v_unit_price, 2))
           end,
+          supplier_id = v_supplier_id,
           supplier = v_supplier,
           purchase_date = case when p_changes ? 'occurred_at' then v_occurred_at::date else purchase_date end
       where id = v_batch.id;
@@ -1071,6 +1309,46 @@ begin
 end;
 $$;
 
+create or replace function public.link_supplier_invoice(
+  p_transaction_id uuid,
+  p_file_path text,
+  p_file_name text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_group_id uuid;
+begin
+  if coalesce(auth.role(), '') <> 'service_role' and not public.is_jiva_user() then
+    raise exception 'Silakan masuk untuk mengubah data JIVA FLORIST.' using errcode = '42501';
+  end if;
+  if p_file_name is null or length(trim(p_file_name)) not between 1 and 255 then
+    raise exception 'Nama file faktur tidak valid.' using errcode = '22023';
+  end if;
+
+  select group_id into v_group_id
+  from public.transactions
+  where id = p_transaction_id and type = 'purchase';
+  if not found then
+    raise exception 'Transaksi pembelian tidak ditemukan.' using errcode = '22023';
+  end if;
+  if p_file_path is null
+    or p_file_path !~ ('^' || v_group_id::text || '/supplier-invoice\.(pdf|jpg|png|webp)$') then
+    raise exception 'Jalur file faktur tidak valid untuk transaksi ini.' using errcode = '22023';
+  end if;
+
+  update public.transactions
+  set supplier_invoice_path = p_file_path,
+      supplier_invoice_filename = trim(p_file_name)
+  where group_id = v_group_id and type = 'purchase';
+
+  return jsonb_build_object('transaction_id', p_transaction_id, 'file_name', trim(p_file_name));
+end;
+$$;
+
 revoke all on function public.register_purchase(uuid, jsonb, numeric, numeric, text) from public, anon, authenticated;
 revoke all on function public.register_purchase_batch(jsonb, text) from public, anon, authenticated;
 revoke all on function public.register_sale(uuid, numeric, numeric, numeric, text) from public, anon, authenticated;
@@ -1081,6 +1359,7 @@ revoke all on function public.get_products_inventory() from public, anon, authen
 revoke all on function public.get_dashboard_summary(integer) from public, anon, authenticated;
 revoke all on function public.edit_product(uuid, jsonb) from public, anon, authenticated;
 revoke all on function public.edit_transaction(uuid, jsonb) from public, anon, authenticated;
+revoke all on function public.link_supplier_invoice(uuid, text, text) from public, anon, authenticated;
 grant execute on function public.register_purchase(uuid, jsonb, numeric, numeric, text) to service_role;
 grant execute on function public.register_purchase_batch(jsonb, text) to service_role;
 grant execute on function public.register_sale(uuid, numeric, numeric, numeric, text) to service_role;
@@ -1091,5 +1370,38 @@ grant execute on function public.get_products_inventory() to service_role;
 grant execute on function public.get_dashboard_summary(integer) to service_role;
 grant execute on function public.edit_product(uuid, jsonb) to service_role;
 grant execute on function public.edit_transaction(uuid, jsonb) to service_role;
+grant execute on function public.link_supplier_invoice(uuid, text, text) to service_role;
+grant execute on function public.get_products_inventory() to authenticated;
+grant execute on function public.get_dashboard_summary(integer) to authenticated;
+grant execute on function public.register_purchase(uuid, jsonb, numeric, numeric, text) to authenticated;
+grant execute on function public.register_purchase_batch(jsonb, text) to authenticated;
+grant execute on function public.register_sale(uuid, numeric, numeric, numeric, text) to authenticated;
+grant execute on function public.register_sale_batch(jsonb, numeric, text) to authenticated;
+grant execute on function public.register_expense(text, numeric, timestamptz) to authenticated;
+grant execute on function public.assess_inventory_nrv(uuid, numeric) to authenticated;
+grant execute on function public.edit_product(uuid, jsonb) to authenticated;
+grant execute on function public.edit_transaction(uuid, jsonb) to authenticated;
+grant execute on function public.link_supplier_invoice(uuid, text, text) to authenticated;
+
+do $$
+declare
+  v_table text;
+begin
+  if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+    foreach v_table in array array['products', 'suppliers', 'inventory_batches', 'transactions']
+    loop
+      if not exists (
+        select 1
+        from pg_publication_tables
+        where pubname = 'supabase_realtime'
+          and schemaname = 'public'
+          and tablename = v_table
+      ) then
+        execute format('alter publication supabase_realtime add table public.%I', v_table);
+      end if;
+    end loop;
+  end if;
+end;
+$$;
 
 notify pgrst, 'reload schema';

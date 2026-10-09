@@ -1,14 +1,39 @@
 "use strict";
 
+const SUPABASE_URL = "https://nksmijoutfylckxcqetz.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_tzMZ5VFwsWoAlfnqPjGMtA_8viPWWVd";
+const cloudMode = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
 const state = {
   dashboard: null,
   products: [],
   transactions: [],
   editing: null,
   apiBase: location.protocol === "file:" ? null : "",
+  realtimeChannel: null,
   settings: { vatEnabled: false, vatRate: 11, incomeTaxEnabled: false, incomeTaxRate: 0.5 }
 };
 const localApiCandidates = ["http://127.0.0.1:3000", "http://127.0.0.1:3001"];
+const invoiceExtensionByType = {
+  "application/pdf": "pdf",
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp"
+};
+let cloudClient = null;
+
+async function hasInvoiceSignature(file, contentType) {
+  const bytes = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+  if (contentType === "application/pdf") return String.fromCharCode(...bytes.slice(0, 5)) === "%PDF-";
+  if (contentType === "image/jpeg") return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  if (contentType === "image/png") {
+    return [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every((byte, index) => bytes[index] === byte);
+  }
+  if (contentType === "image/webp") {
+    return String.fromCharCode(...bytes.slice(0, 4)) === "RIFF"
+      && String.fromCharCode(...bytes.slice(8, 12)) === "WEBP";
+  }
+  return false;
+}
 
 const flowerStyles = {
   aster: { petals: 13, colors: ["#9a71bf", "#dbc2ef"], center: "#f3cb62", background: ["#f7efff", "#e9d8f8"] },
@@ -61,16 +86,312 @@ function showNotice(title, message, kind = "warning") {
   notice.hidden = false;
 }
 
+function showLogin(message = "") {
+  document.querySelector(".app-shell").hidden = true;
+  document.getElementById("logout-button").hidden = true;
+  const screen = document.getElementById("login-screen");
+  screen.hidden = false;
+  const error = document.getElementById("login-error");
+  error.textContent = message;
+  error.hidden = !message;
+  document.getElementById("login-username").focus();
+}
+
+function showWorkspace() {
+  document.getElementById("login-screen").hidden = true;
+  document.querySelector(".app-shell").hidden = false;
+}
+
 async function request(path, options = {}) {
+  if (cloudMode) return cloudRequest(path, options);
   const response = await fetch(`${state.apiBase || ""}${path}`, {
     ...options,
     headers: { "Content-Type": "application/json", ...options.headers }
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(body.error || `Permintaan gagal (${response.status}).`);
+    if (response.status === 401) showLogin();
+    const error = new Error(body.error || `Permintaan gagal (${response.status}).`);
+    error.status = response.status;
+    throw error;
   }
   return body;
+}
+
+function getCloudClient() {
+  if (!cloudMode) throw new Error("Koneksi Supabase web belum dikonfigurasi.");
+  if (!window.supabase?.createClient) {
+    throw new Error("Pustaka Supabase gagal dimuat. Periksa koneksi internet dan muat ulang halaman.");
+  }
+  if (!cloudClient) {
+    cloudClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+    });
+  }
+  return cloudClient;
+}
+
+function parseRequestBody(options) {
+  if (!options.body) return {};
+  if (typeof options.body === "string") return JSON.parse(options.body);
+  return options.body;
+}
+
+async function cloudRpc(name, args = {}) {
+  const { data, error } = await getCloudClient().rpc(name, args);
+  if (error) throw new Error(error.message || `Supabase gagal menjalankan ${name}.`);
+  return data;
+}
+
+async function cloudRequest(path, options = {}) {
+  const client = getCloudClient();
+  const method = options.method || "GET";
+  const body = parseRequestBody(options);
+  if (path === "/api/auth/session" && method === "GET") {
+    const { data, error } = await client.auth.getSession();
+    if (error) throw new Error(error.message);
+    if (!data.session) return { authenticated: false, required: true };
+    const { data: allowed, error: allowedError } = await client.rpc("is_jiva_user");
+    if (allowedError) throw new Error(allowedError.message);
+    return { authenticated: Boolean(allowed), required: true, denied: !allowed };
+  }
+  if (path === "/api/auth/login" && method === "POST") {
+    const { data, error } = await client.auth.signInWithPassword({
+      email: String(body.username || "").trim(),
+      password: String(body.password || "")
+    });
+    if (error) throw new Error("Email atau kata sandi tidak sesuai.");
+    const { data: allowed, error: allowedError } = await client.rpc("is_jiva_user");
+    if (allowedError || !allowed) {
+      const { error: signOutError } = await client.auth.signOut();
+      if (signOutError) throw new Error(`Akun tidak diizinkan dan sesi tidak dapat ditutup: ${signOutError.message}`);
+      if (allowedError) throw new Error(`Akses akun belum dapat diperiksa: ${allowedError.message}`);
+      throw new Error("Email ini belum diizinkan. Minta pemilik JIVA FLORIST menambahkan email ke daftar akses.");
+    }
+    return { authenticated: Boolean(data.session) };
+  }
+  if (path === "/api/auth/logout" && method === "POST") {
+    const { error } = await client.auth.signOut();
+    if (error) throw new Error(error.message);
+    stopRealtimeUpdates();
+    return { authenticated: false };
+  }
+  if (path === "/api/products" && method === "GET") {
+    return cloudRpc("get_products_inventory");
+  }
+  if (path.startsWith("/api/dashboard") && method === "GET") {
+    const days = Number(new URLSearchParams(path.split("?")[1] || "").get("days") || 7);
+    return cloudRpc("get_dashboard_summary", { p_days: days });
+  }
+  if (path.startsWith("/api/transactions?") && method === "GET") {
+    return cloudGetTransactions(Number(new URLSearchParams(path.split("?")[1]).get("limit") || 100));
+  }
+  const productEdit = path.match(/^\/api\/products\/([0-9a-f-]+)$/i);
+  if (productEdit && method === "PUT") {
+    return cloudRpc("edit_product", { p_product_id: productEdit[1], p_changes: body });
+  }
+  const transactionEdit = path.match(/^\/api\/transactions\/([0-9a-f-]+)$/i);
+  if (transactionEdit && method === "PUT") {
+    const changes = { ...body };
+    if (changes.occurred_at) {
+      changes.occurred_at = new Date(`${changes.occurred_at}T12:00:00+07:00`).toISOString();
+    }
+    return cloudRpc("edit_transaction", { p_transaction_id: transactionEdit[1], p_changes: changes });
+  }
+  if (path === "/api/purchases/batch" && method === "POST") {
+    return cloudRpc("register_purchase_batch", { p_items: body.items, p_supplier: body.supplier || null });
+  }
+  if (path === "/api/purchases" && method === "POST") {
+    return cloudRpc("register_purchase", {
+      p_product_id: body.product_id || null,
+      p_new_product: body.new_product || null,
+      p_quantity: body.quantity,
+      p_unit_cost: body.unit_cost,
+      p_supplier: body.supplier || null
+    });
+  }
+  if (path === "/api/sales/batch" && method === "POST") {
+    return cloudRpc("register_sale_batch", {
+      p_items: body.items,
+      p_vat_rate: body.vat_rate ?? 0,
+      p_description: body.description || null
+    });
+  }
+  if (path === "/api/sales" && method === "POST") {
+    return cloudRpc("register_sale", {
+      p_product_id: body.product_id,
+      p_quantity: body.quantity,
+      p_target_margin: body.target_margin,
+      p_vat_rate: body.vat_rate ?? 0,
+      p_description: body.description || null
+    });
+  }
+  if (path === "/api/expenses" && method === "POST") {
+    return cloudRpc("register_expense", {
+      p_description: body.description,
+      p_amount: body.amount,
+      p_occurred_at: body.occurred_at ? new Date(`${body.occurred_at}T12:00:00+07:00`).toISOString() : null
+    });
+  }
+  if (path === "/api/nrv" && method === "POST") {
+    return cloudRpc("assess_inventory_nrv", { p_product_id: body.product_id, p_nrv_unit: body.nrv_unit });
+  }
+  throw new Error(`Operasi ${method} ${path} belum didukung pada koneksi Supabase langsung.`);
+}
+
+async function cloudGetTransactions(limit) {
+  const client = getCloudClient();
+  const { data: transactions, error } = await client
+    .from("transactions")
+    .select("id,group_id,product_id,type,description,quantity,unit_price,subtotal,cogs,gross_profit,vat_rate,vat_amount,occurred_at,supplier_invoice_path,supplier_invoice_filename")
+    .order("occurred_at", { ascending: false })
+    .limit(Math.min(Math.max(limit, 1), 100));
+  if (error) throw new Error(error.message);
+
+  const productIds = [...new Set(transactions.map((transaction) => transaction.product_id).filter(Boolean))];
+  const purchaseIds = transactions.filter((transaction) => transaction.type === "purchase").map((transaction) => transaction.id);
+  const [productsResult, batchesResult] = await Promise.all([
+    productIds.length
+      ? client.from("products").select("id,name,unit").in("id", productIds)
+      : Promise.resolve({ data: [], error: null }),
+    purchaseIds.length
+      ? client.from("inventory_batches").select("source_transaction_id,supplier,supplier_id,suppliers(name),quantity_remaining,quantity_in").in("source_transaction_id", purchaseIds)
+      : Promise.resolve({ data: [], error: null })
+  ]);
+  if (productsResult.error) throw new Error(productsResult.error.message);
+  if (batchesResult.error) throw new Error(batchesResult.error.message);
+  const products = new Map((productsResult.data || []).map((product) => [product.id, product]));
+  const batches = new Map((batchesResult.data || []).map((batch) => [batch.source_transaction_id, batch]));
+  return transactions.map((transaction) => {
+    const product = products.get(transaction.product_id);
+    const batch = batches.get(transaction.id);
+    return {
+      ...transaction,
+      product_name: product?.name || null,
+      unit: product?.unit || "",
+      batch_supplier: batch?.suppliers?.name || batch?.supplier || "",
+      batch_remaining: batch?.quantity_remaining ?? null,
+      batch_quantity: batch?.quantity_in ?? null,
+      has_supplier_invoice: Boolean(transaction.supplier_invoice_path)
+    };
+  });
+}
+
+function startRealtimeUpdates() {
+  if (!cloudMode || state.realtimeChannel) return;
+  const client = getCloudClient();
+  let refreshTimer;
+  state.realtimeChannel = client.channel("jiva-florist-live")
+    .on("postgres_changes", { event: "*", schema: "public", table: "products" }, () => scheduleRefresh())
+    .on("postgres_changes", { event: "*", schema: "public", table: "suppliers" }, () => scheduleRefresh())
+    .on("postgres_changes", { event: "*", schema: "public", table: "inventory_batches" }, () => scheduleRefresh())
+    .on("postgres_changes", { event: "*", schema: "public", table: "transactions" }, () => scheduleRefresh())
+    .subscribe((status) => {
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        showNotice("Sinkronisasi langsung terputus", "Data tetap tersimpan di Supabase; muat ulang halaman untuk mengambil perubahan terbaru.", "error");
+      }
+    });
+  function scheduleRefresh() {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => refreshAll(), 300);
+  }
+}
+
+function stopRealtimeUpdates() {
+  if (!state.realtimeChannel || !cloudClient) return;
+  cloudClient.removeChannel(state.realtimeChannel);
+  state.realtimeChannel = null;
+}
+
+async function cloudSalesReport(from, to) {
+  const client = getCloudClient();
+  const fromTimestamp = `${from}T00:00:00+07:00`;
+  const untilDate = new Date(`${to}T00:00:00Z`);
+  untilDate.setUTCDate(untilDate.getUTCDate() + 1);
+  const untilExclusive = `${untilDate.toISOString().slice(0, 10)}T00:00:00+07:00`;
+  const rows = [];
+  const pageSize = 1000;
+  const maximumRows = 50000;
+  for (let offset = 0; offset <= maximumRows; offset += pageSize) {
+    const size = Math.min(pageSize, maximumRows + 1 - offset);
+    const { data, error } = await client.from("transactions")
+      .select("id,description,quantity,unit_price,subtotal,cogs,gross_profit,vat_rate,vat_amount,occurred_at,product_id")
+      .eq("type", "sale")
+      .gte("occurred_at", fromTimestamp)
+      .lt("occurred_at", untilExclusive)
+      .order("occurred_at", { ascending: true })
+      .order("id", { ascending: true })
+      .range(offset, offset + size - 1);
+    if (error) throw new Error(error.message);
+    rows.push(...data);
+    if (rows.length > maximumRows) throw new Error("Laporan melebihi batas 50.000 transaksi. Pilih rentang tanggal yang lebih pendek.");
+    if (data.length < size) break;
+  }
+  const productIds = [...new Set(rows.map((row) => row.product_id).filter(Boolean))];
+  const { data: products, error } = productIds.length
+    ? await client.from("products").select("id,name,unit").in("id", productIds)
+    : { data: [], error: null };
+  if (error) throw new Error(error.message);
+  const productById = new Map((products || []).map((product) => [product.id, product]));
+  return {
+    business: "JIVA FLORIST",
+    location: "Magelang, Jawa Tengah",
+    from,
+    to,
+    rows: rows.map((row) => ({
+      ...row,
+      product_name: productById.get(row.product_id)?.name || "",
+      unit: productById.get(row.product_id)?.unit || ""
+    }))
+  };
+}
+
+async function openSupplierInvoice(transaction) {
+  const invoiceWindow = window.open("about:blank", "_blank");
+  if (!invoiceWindow) {
+    showNotice("Jendela faktur diblokir", "Izinkan pop-up untuk situs JIVA FLORIST, lalu coba lagi.", "error");
+    return;
+  }
+  try {
+    const { data, error } = await getCloudClient().storage
+      .from("supplier-invoices")
+      .download(transaction.supplier_invoice_path);
+    if (error) throw new Error(error.message);
+    const objectUrl = URL.createObjectURL(data);
+    invoiceWindow.location.replace(objectUrl);
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+  } catch (error) {
+    invoiceWindow.close();
+    showNotice("Faktur belum dapat dibuka", error.message, "error");
+  }
+}
+
+function salesReportCsv(report) {
+  const escapeCell = (value) => {
+    let text = String(value ?? "");
+    if (/^[\s\u0000-\u001f]*[=+\-@]/.test(text)) text = `'${text}`;
+    return `"${text.replace(/"/g, '""')}"`;
+  };
+  const headings = [
+    "Waktu transaksi", "Produk", "Jumlah", "Satuan", "Harga per unit (Rp)",
+    "Penjualan bersih (Rp)", "PPN (%)", "PPN (Rp)", "HPP FIFO (Rp)", "Laba kotor (Rp)", "Catatan"
+  ];
+  const lines = [headings, ...report.rows.map((row) => [
+    row.occurred_at, row.product_name, row.quantity, row.unit, row.unit_price,
+    row.subtotal, Number(row.vat_rate) * 100, row.vat_amount, row.cogs, row.gross_profit, row.description
+  ])].map((line) => line.map(escapeCell).join(","));
+  return `\uFEFF${lines.join("\r\n")}`;
+}
+
+async function getSession() {
+  if (cloudMode) return request("/api/auth/session");
+  try {
+    return await request("/api/auth/session");
+  } catch (error) {
+    const localHost = location.protocol === "file:" || ["localhost", "127.0.0.1"].includes(location.hostname);
+    if (localHost && [404, 405].includes(error.status)) return { authenticated: true, required: false };
+    throw error;
+  }
 }
 
 async function discoverLocalApi() {
@@ -309,7 +630,9 @@ function renderTransactions(transactions) {
     const invoiceActions = transaction.type === "sale"
       ? `<button class="row-edit-button" type="button" data-invoice-transaction="${transaction.id}" aria-label="Buat bukti penjualan ${escapeHtml(transactionTitle(transaction))}" title="Cetak bukti penjualan">Invoice</button>`
       : transaction.type === "purchase"
-        ? `${transaction.has_supplier_invoice ? `<a class="row-edit-button" href="${state.apiBase || ""}/api/transactions/${transaction.id}/supplier-invoice" target="_blank" rel="noopener" aria-label="Lihat faktur pemasok ${escapeHtml(transactionTitle(transaction))}">Lihat faktur</a>` : ""}<button class="row-edit-button" type="button" data-upload-supplier-invoice="${transaction.id}" aria-label="${transaction.has_supplier_invoice ? "Ganti" : "Unggah"} faktur pemasok ${escapeHtml(transactionTitle(transaction))}">${transaction.has_supplier_invoice ? "Ganti faktur" : "Unggah faktur"}</button>`
+        ? `${transaction.has_supplier_invoice ? cloudMode
+          ? `<button class="row-edit-button" type="button" data-open-supplier-invoice="${transaction.id}" aria-label="Lihat faktur pemasok ${escapeHtml(transactionTitle(transaction))}">Lihat faktur</button>`
+          : `<a class="row-edit-button" href="${state.apiBase || ""}/api/transactions/${transaction.id}/supplier-invoice" target="_blank" rel="noopener" aria-label="Lihat faktur pemasok ${escapeHtml(transactionTitle(transaction))}">Lihat faktur</a>` : ""}<button class="row-edit-button" type="button" data-upload-supplier-invoice="${transaction.id}" aria-label="${transaction.has_supplier_invoice ? "Ganti" : "Unggah"} faktur pemasok ${escapeHtml(transactionTitle(transaction))}">${transaction.has_supplier_invoice ? "Ganti faktur" : "Unggah faktur"}</button>`
         : "";
     return `<tr><td>${escapeHtml(transactionTitle(transaction))}</td><td>${transactionKind(transaction.type)}</td><td>${escapeHtml(transaction.product_name || "—")}</td><td>${formatDate(transaction.occurred_at)}</td><td class="align-right">${rupiah(amount)}</td><td><div class="row-actions">${invoiceActions}<button class="row-edit-button" type="button" data-edit-transaction="${transaction.id}" aria-label="Edit ${escapeHtml(transactionTitle(transaction))}" title="Edit transaksi">Edit</button></div></td></tr>`;
   }).join("") || '<tr><td colspan="6" class="table-empty">Belum ada transaksi.</td></tr>';
@@ -368,7 +691,10 @@ async function refreshAll() {
     document.getElementById("recent-transactions").innerHTML = '<tr><td colspan="5" class="table-empty">Transaksi belum dapat dimuat.</td></tr>';
     document.getElementById("transactions-table").innerHTML = '<tr><td colspan="6" class="table-empty">Transaksi belum dapat dimuat.</td></tr>';
     document.getElementById("inventory-table").innerHTML = '<tr><td colspan="7" class="table-empty">Persediaan belum dapat dimuat.</td></tr>';
-    showNotice("Data belum dapat dimuat", `${error.message} Pastikan Supabase sudah disiapkan dan server dijalankan sesuai README.`, "error");
+    const nextStep = cloudMode
+      ? "Periksa URL/key publik, akun undangan, dan kebijakan RLS Supabase."
+      : "Pastikan Supabase sudah disiapkan dan server dijalankan sesuai README.";
+    showNotice("Data belum dapat dimuat", `${error.message} ${nextStep}`, "error");
   }
 }
 
@@ -772,6 +1098,10 @@ function loadSettings() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  if (cloudMode) {
+    document.querySelector('label[for="login-username"] .field-label').textContent = "Email akun undangan";
+    document.getElementById("login-username").type = "email";
+  }
   document.getElementById("today-label").textContent = new Intl.DateTimeFormat("id-ID", {
     weekday: "short", day: "numeric", month: "short", year: "numeric"
   }).format(new Date());
@@ -779,11 +1109,74 @@ document.addEventListener("DOMContentLoaded", () => {
     weekday: "long", day: "numeric", month: "long", year: "numeric"
   }).format(new Date()).toUpperCase();
   loadSettings();
+  document.getElementById("login-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const submit = document.getElementById("login-submit");
+    const error = document.getElementById("login-error");
+    submit.disabled = true;
+    submit.textContent = "Memeriksa...";
+    error.hidden = true;
+    try {
+      await request("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({
+          username: form.elements.username.value,
+          password: form.elements.password.value
+        })
+      });
+      const session = await request("/api/auth/session");
+      if (!session.authenticated) throw new Error("Sesi belum aktif. Periksa nama pengguna dan kata sandi, lalu coba lagi.");
+      form.reset();
+      showWorkspace();
+      document.getElementById("logout-button").hidden = !session.required;
+      startRealtimeUpdates();
+      await refreshAll();
+    } catch (loginError) {
+      error.textContent = loginError.message;
+      error.hidden = false;
+    } finally {
+      submit.disabled = false;
+      submit.textContent = "Masuk";
+    }
+  });
+  document.getElementById("logout-button").addEventListener("click", async () => {
+    try {
+      await request("/api/auth/logout", { method: "POST", body: "{}" });
+      stopRealtimeUpdates();
+      showLogin();
+    } catch (error) {
+      showNotice("Tidak dapat keluar", error.message, "error");
+    }
+  });
   (async () => {
     try {
+      if (location.hostname.endsWith("github.io") && !cloudMode) {
+        showLogin("Hubungkan aplikasi ke Supabase dengan Project URL dan anon key publik pada script.js.");
+        document.getElementById("connection-state").textContent = "Supabase belum dikonfigurasi";
+        document.getElementById("connection-dot").classList.add("connection-error");
+        return;
+      }
       if (location.protocol === "file:") await discoverLocalApi();
+      const session = await getSession();
+      if (session.required && !session.authenticated) {
+        showLogin(session.denied
+          ? "Email ini belum diizinkan. Minta pemilik JIVA FLORIST menambahkan email ke daftar akses."
+          : "");
+        return;
+      }
+      document.getElementById("logout-button").hidden = !session.required;
+      showWorkspace();
+      startRealtimeUpdates();
       await refreshAll();
     } catch (error) {
+      if (cloudMode) {
+        showLogin(error.message);
+        document.getElementById("connection-state").textContent = "Supabase belum siap";
+        document.getElementById("connection-dot").classList.add("connection-error");
+        return;
+      }
+      showWorkspace();
       document.getElementById("connection-state").textContent = "Backend belum terhubung";
       document.getElementById("connection-dot").classList.add("connection-error");
       showNotice("Data belum dapat dimuat", error.message, "error");
@@ -815,6 +1208,12 @@ document.addEventListener("DOMContentLoaded", () => {
     if (product) openTransactionDialog("product", product);
   });
   document.getElementById("transactions-table").addEventListener("click", (event) => {
+    const openInvoiceButton = event.target.closest("[data-open-supplier-invoice]");
+    if (openInvoiceButton) {
+      const transaction = state.transactions.find((item) => item.id === openInvoiceButton.dataset.openSupplierInvoice);
+      if (transaction) void openSupplierInvoice(transaction);
+      return;
+    }
     const uploadButton = event.target.closest("[data-upload-supplier-invoice]");
     if (uploadButton) {
       const transaction = state.transactions.find((item) => item.id === uploadButton.dataset.uploadSupplierInvoice);
@@ -842,20 +1241,39 @@ document.addEventListener("DOMContentLoaded", () => {
           showNotice("File terlalu besar", "Ukuran faktur maksimal 10 MB.", "error");
           return;
         }
+        if (!await hasInvoiceSignature(file, contentType)) {
+          showNotice("Isi file tidak cocok", "File tidak dikenali sebagai dokumen dengan format yang dipilih.", "error");
+          return;
+        }
         uploadButton.disabled = true;
         uploadButton.textContent = "Mengunggah...";
         let invoiceSaved = false;
         try {
-          const response = await fetch(`${state.apiBase || ""}/api/transactions/${transaction.id}/supplier-invoice`, {
-            method: "POST",
-            headers: {
-              "Content-Type": contentType,
-              "X-File-Name": encodeURIComponent(file.name)
-            },
-            body: file
-          });
-          const body = await response.json().catch(() => ({}));
-          if (!response.ok) throw new Error(body.error || `Unggah gagal (${response.status}).`);
+          if (cloudMode) {
+            const extension = invoiceExtensionByType[contentType];
+            const objectPath = `${transaction.group_id}/supplier-invoice.${extension}`;
+            const { error } = await getCloudClient().storage.from("supplier-invoices").upload(objectPath, file, {
+              contentType,
+              upsert: true
+            });
+            if (error) throw new Error(error.message);
+            await cloudRpc("link_supplier_invoice", {
+              p_transaction_id: transaction.id,
+              p_file_path: objectPath,
+              p_file_name: file.name
+            });
+          } else {
+            const response = await fetch(`${state.apiBase || ""}/api/transactions/${transaction.id}/supplier-invoice`, {
+              method: "POST",
+              headers: {
+                "Content-Type": contentType,
+                "X-File-Name": encodeURIComponent(file.name)
+              },
+              body: file
+            });
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(body.error || `Unggah gagal (${response.status}).`);
+          }
           invoiceSaved = true;
           try {
             await refreshTransactions();
@@ -920,12 +1338,18 @@ document.addEventListener("DOMContentLoaded", () => {
     button.disabled = true;
     button.textContent = "Menyiapkan...";
     try {
-      const response = await fetch(`${state.apiBase || ""}/api/reports/sales.csv?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.error || `Unduhan gagal (${response.status}).`);
+      let blob;
+      if (cloudMode) {
+        const report = await cloudSalesReport(from, to);
+        blob = new Blob([salesReportCsv(report)], { type: "text/csv;charset=utf-8" });
+      } else {
+        const response = await fetch(`${state.apiBase || ""}/api/reports/sales.csv?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.error || `Unduhan gagal (${response.status}).`);
+        }
+        blob = await response.blob();
       }
-      const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -959,9 +1383,14 @@ document.addEventListener("DOMContentLoaded", () => {
     button.disabled = true;
     button.textContent = "Menyiapkan...";
     try {
-      const response = await fetch(`${state.apiBase || ""}/api/reports/sales.json?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
-      const report = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(report.error || `Laporan gagal dimuat (${response.status}).`);
+      let report;
+      if (cloudMode) {
+        report = await cloudSalesReport(from, to);
+      } else {
+        const response = await fetch(`${state.apiBase || ""}/api/reports/sales.json?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+        report = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(report.error || `Laporan gagal dimuat (${response.status}).`);
+      }
       printDocument(`Laporan penjualan JIVA FLORIST ${from} - ${to}`, salesReportMarkup(report), printWindow, true);
     } catch (error) {
       printWindow.close();
