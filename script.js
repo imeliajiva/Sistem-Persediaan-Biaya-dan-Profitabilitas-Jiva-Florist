@@ -91,10 +91,24 @@ function showLogin(message = "") {
   document.getElementById("logout-button").hidden = true;
   const screen = document.getElementById("login-screen");
   screen.hidden = false;
+  document.getElementById("login-form").hidden = false;
+  document.getElementById("password-reset-form").hidden = true;
   const error = document.getElementById("login-error");
   error.textContent = message;
   error.hidden = !message;
   document.getElementById("login-username").focus();
+}
+
+function showPasswordReset(message = "") {
+  document.querySelector(".app-shell").hidden = true;
+  document.getElementById("login-screen").hidden = false;
+  document.getElementById("login-form").hidden = true;
+  const form = document.getElementById("password-reset-form");
+  form.hidden = false;
+  const error = document.getElementById("password-reset-error");
+  error.textContent = message;
+  error.hidden = !message;
+  if (!message) document.getElementById("new-password").focus();
 }
 
 function showWorkspace() {
@@ -1101,6 +1115,7 @@ document.addEventListener("DOMContentLoaded", () => {
   if (cloudMode) {
     document.querySelector('label[for="login-username"] .field-label').textContent = "Email akun undangan";
     document.getElementById("login-username").type = "email";
+    document.getElementById("request-password-reset").hidden = false;
   }
   document.getElementById("today-label").textContent = new Intl.DateTimeFormat("id-ID", {
     weekday: "short", day: "numeric", month: "short", year: "numeric"
@@ -1140,6 +1155,71 @@ document.addEventListener("DOMContentLoaded", () => {
       submit.textContent = "Masuk";
     }
   });
+  document.getElementById("request-password-reset").addEventListener("click", async () => {
+    const emailInput = document.getElementById("login-username");
+    const error = document.getElementById("login-error");
+    if (!emailInput.value.trim() || !emailInput.validity.valid) {
+      error.textContent = "Masukkan alamat email akun terlebih dahulu.";
+      error.hidden = false;
+      emailInput.focus();
+      return;
+    }
+    const button = document.getElementById("request-password-reset");
+    button.disabled = true;
+    error.hidden = true;
+    try {
+      const { error: resetError } = await getCloudClient().auth.resetPasswordForEmail(emailInput.value.trim(), {
+        redirectTo: `${location.origin}${location.pathname}`
+      });
+      if (resetError) throw new Error(resetError.message);
+      error.textContent = "Jika email terdaftar, tautan untuk membuat kata sandi baru akan dikirim. Periksa kotak masuk dan folder spam.";
+      error.hidden = false;
+    } catch (resetError) {
+      error.textContent = resetError.message;
+      error.hidden = false;
+    } finally {
+      button.disabled = false;
+    }
+  });
+  document.getElementById("password-reset-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const submit = document.getElementById("password-reset-submit");
+    const error = document.getElementById("password-reset-error");
+    const password = form.elements.password.value;
+    if (password !== form.elements["confirm-password"].value) {
+      error.textContent = "Kedua kata sandi belum sama.";
+      error.hidden = false;
+      return;
+    }
+    submit.disabled = true;
+    submit.textContent = "Menyimpan...";
+    error.hidden = true;
+    try {
+      const { error: updateError } = await getCloudClient().auth.updateUser({ password });
+      if (updateError) throw new Error(updateError.message);
+      const { data: allowed, error: allowedError } = await getCloudClient().rpc("is_jiva_user");
+      if (allowedError) throw new Error(`Kata sandi sudah diperbarui, tetapi akses akun belum dapat diperiksa: ${allowedError.message}`);
+      if (!allowed) {
+        const { error: signOutError } = await getCloudClient().auth.signOut();
+        if (signOutError) throw new Error(`Kata sandi diperbarui, tetapi akun tidak diizinkan dan sesi tidak dapat ditutup: ${signOutError.message}`);
+        throw new Error("Kata sandi diperbarui, tetapi email ini belum ditambahkan ke daftar akses JIVA FLORIST.");
+      }
+      history.replaceState(null, "", `${location.pathname}${location.search}`);
+      form.reset();
+      document.getElementById("logout-button").hidden = false;
+      showWorkspace();
+      startRealtimeUpdates();
+      await refreshAll();
+      showNotice("Kata sandi diperbarui", "Kata sandi baru berhasil disimpan.", "success");
+    } catch (resetError) {
+      error.textContent = resetError.message;
+      error.hidden = false;
+    } finally {
+      submit.disabled = false;
+      submit.textContent = "Simpan kata sandi";
+    }
+  });
   document.getElementById("logout-button").addEventListener("click", async () => {
     try {
       await request("/api/auth/logout", { method: "POST", body: "{}" });
@@ -1155,6 +1235,17 @@ document.addEventListener("DOMContentLoaded", () => {
         showLogin("Hubungkan aplikasi ke Supabase dengan Project URL dan anon key publik pada script.js.");
         document.getElementById("connection-state").textContent = "Supabase belum dikonfigurasi";
         document.getElementById("connection-dot").classList.add("connection-error");
+        return;
+      }
+      const recoveryLink = cloudMode && new URLSearchParams(location.hash.slice(1)).get("type") === "recovery";
+      if (recoveryLink) {
+        const { data, error } = await getCloudClient().auth.getSession();
+        if (error) throw new Error(error.message);
+        if (!data.session) {
+          showLogin("Tautan reset tidak valid atau sudah kedaluwarsa. Minta tautan baru dengan tombol Lupa kata sandi.");
+          return;
+        }
+        showPasswordReset();
         return;
       }
       if (location.protocol === "file:") await discoverLocalApi();

@@ -66,6 +66,7 @@ GitHub Pages hanya menyajikan file statis dan tidak menjalankan `app.js`. Mode S
    Commit perubahan di branch `main`. Untuk mode ini, `app.js`, `supabase.js`, dan `package.json` tidak dijalankan oleh GitHub Pages.
 5. Pastikan GitHub Pages aktif pada repositori (Settings → Pages → Deploy from a branch → `main` / root). Buka link `github.io` setelah deployment selesai.
 6. Masuk menggunakan email akun yang telah dibuat/diundang. Semua PC membaca database Supabase yang sama; perubahan pengguna lain diperbarui otomatis melalui Realtime, atau setelah halaman dimuat ulang.
+   Jika lupa kata sandi, masukkan email akun pada layar masuk, pilih **Lupa kata sandi?**, lalu buka tautan dari email dan isi kata sandi baru di aplikasi.
 
 Jangan membuat policy `anon` untuk membaca atau mengubah tabel. RLS memeriksa email terhadap daftar privat, sehingga akun lain tidak dapat membaca atau mengubah data walaupun pendaftaran Supabase masih terbuka. Daftar akses berada di schema internal `private` dan tidak menambah entitas pada ERD bisnis tiga entitas. Setiap akun yang diizinkan mempunyai akses penuh ke data JIVA FLORIST, jadi masukkan hanya email orang yang dipercaya. Perbarui file GitHub Pages tanpa menghapus database; tidak perlu menjalankan ulang SQL untuk setiap pembaruan kode.
 

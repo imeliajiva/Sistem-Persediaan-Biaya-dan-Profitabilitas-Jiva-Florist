@@ -26,6 +26,17 @@
         <label class="form-field" for="login-password"><span class="field-label">Kata sandi</span><input class="text-input" id="login-password" name="password" type="password" autocomplete="current-password" required></label>
         <p class="login-error" id="login-error" role="alert" hidden></p>
         <button class="button button-primary login-submit" id="login-submit" type="submit">Masuk</button>
+        <button class="button button-quiet login-submit" id="request-password-reset" type="button" hidden>Lupa kata sandi?</button>
+      </form>
+      <form class="login-card" id="password-reset-form" hidden>
+        <div class="login-mark" aria-hidden="true">✿</div>
+        <p class="eyebrow">JIVA FLORIST · MAGELANG</p>
+        <h1>Buat kata sandi baru</h1>
+        <p class="login-description">Atur kata sandi baru untuk akun JIVA FLORIST kamu.</p>
+        <label class="form-field" for="new-password"><span class="field-label">Kata sandi baru</span><input class="text-input" id="new-password" name="password" type="password" autocomplete="new-password" minlength="8" required></label>
+        <label class="form-field" for="confirm-password"><span class="field-label">Ulangi kata sandi baru</span><input class="text-input" id="confirm-password" name="confirm-password" type="password" autocomplete="new-password" minlength="8" required></label>
+        <p class="login-error" id="password-reset-error" role="alert" hidden></p>
+        <button class="button button-primary login-submit" id="password-reset-submit" type="submit">Simpan kata sandi</button>
       </form>
     </main>
     <div class="app-shell" hidden>
